@@ -23,7 +23,7 @@ class MiniMaxConfig:
     n_layer: int = 12
     n_head: int = 8
     n_embd: int = 512
-    vocab_size: int = 30000
+    vocab_size: int = 200000
     block_size: int = 1024
     dropout: float = 0.1
     pad_token_id: int = 0
@@ -141,9 +141,6 @@ def apply_xpos_rotary_pos_emb(q, k, cos, sin):
 # 4) OptimizedLightningAttention
 # ------------------------------------------------------------------------
 class OptimizedLightningAttention(nn.Module):
-    """
-    'Lightning' multi-head attention with optional flash-attn and kv_cache.
-    """
     def __init__(self, config: MiniMaxConfig):
         super().__init__()
         self.config = config
@@ -174,13 +171,13 @@ class OptimizedLightningAttention(nn.Module):
             self.xpos = None
 
     def _shape_heads(self, x: torch.Tensor, B: int, T: int):
-        # reshape for [B, n_head, T, head_dim]
+        # Reshape for [B, n_head, T, head_dim]
         return x.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
     def forward(
         self, x: torch.Tensor, mask: Optional[torch.Tensor] = None,
         layer_past: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        layer_idx: Optional[int] = None  # For adaptive XPos scaling
+        layer_idx: Optional[int] = None
     ):
         B, T, C = x.shape
         qkv = self.c_attn(x)
@@ -190,7 +187,6 @@ class OptimizedLightningAttention(nn.Module):
         k = self._shape_heads(k, B, T)
         v = self._shape_heads(v, B, T)
 
-        # handle past kv if caching
         if layer_past is not None and self.kv_cache_enabled:
             pk, pv = layer_past
             k = torch.cat((pk, k), dim=2)
@@ -198,13 +194,11 @@ class OptimizedLightningAttention(nn.Module):
         if self.kv_cache_enabled:
             self.kv_cache = (k, v)
 
-        # Apply Rotary Positional Embedding if enabled
         if self.xpos is not None:
             cos, sin = self.xpos(seq_len=T, device=x.device, layer_depth=layer_idx)
             q, k = apply_xpos_rotary_pos_emb(q, k, cos, sin)
 
         if self.use_flash:
-            # use built-in flash-attn
             y = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=mask,
@@ -215,12 +209,13 @@ class OptimizedLightningAttention(nn.Module):
             scale = 1.0 / math.sqrt(self.head_dim)
             att = torch.matmul(q, k.transpose(-2, -1)) * scale
             if mask is not None:
+                # Fix: Expand the mask
+                mask = mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, T]
                 att = att.masked_fill(mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = torch.matmul(att, v)
 
-        # merge heads
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
         return y
@@ -339,8 +334,8 @@ class MemoryEfficientMoE(nn.Module):
         used_slots = torch.zeros(E, dtype=torch.int32, device=device)
 
         for i_k in range(self.top_k):
-            w = top_vals[:, i_k]        # (N,)
-            e_idx = top_inds[:, i_k]    # (N,)
+            w = top_vals[:, i_k]        # [N]
+            e_idx = top_inds[:, i_k]    # [N]
 
             # Filter out tokens with negligible weights
             mask = w > 1e-9
@@ -361,7 +356,6 @@ class MemoryEfficientMoE(nn.Module):
                     continue
                 if c_after > capacity:
                     allowed = capacity - c_before
-                    # Select only allowed tokens
                     selected = mask_eid.nonzero(as_tuple=True)[0][:allowed]
                     real_idx = valid_idx[selected]
                     used_slots[eid] = capacity
@@ -375,9 +369,13 @@ class MemoryEfficientMoE(nn.Module):
 
                 # Dispatch tokens to experts
                 tokens = x.view(N, C)[real_idx]
+                # Process tokens through the expert
                 y_ = self.experts[eid](tokens)
-                w_ = w[real_idx].unsqueeze(-1)
+                y_ = y_.view(len(real_idx), -1)  # Ensure proper shape alignment
+                w_ = w[real_idx].view(-1, 1)  # Shape: [num_selected_tokens, 1]
                 out[real_idx] += w_ * y_
+
+
 
         # Sum up auxiliary losses
         self.aux_loss = balance + z_loss
